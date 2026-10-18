@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>棒人間モーション変換</title>
+<style>
+:root{color-scheme:dark;--bg:#0b1020;--panel:#151c30;--line:#2b3550;--text:#eef3ff;--muted:#a8b4ce;--accent:#7c9cff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif}
+main{max-width:900px;margin:auto;padding:20px}h1{font-size:clamp(1.4rem,4vw,2rem);margin:0 0 8px}.sub{color:var(--muted);line-height:1.6;margin:0 0 18px}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:16px;margin:14px 0}
+label.upload{display:inline-flex;align-items:center;gap:8px;background:#26365f;padding:11px 15px;border-radius:10px;cursor:pointer;font-weight:650}
+input[type=file]{position:absolute;left:-9999px}.stage{background:#000;border-radius:12px;overflow:hidden;min-height:220px;display:grid;place-items:center}
+canvas{display:block;width:100%;height:auto;max-height:68vh;object-fit:contain}
+#placeholder{padding:45px 18px;text-align:center;color:#9da9c4;line-height:1.7}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:12px}
+button{background:#26365f;color:white;border:1px solid #425582;border-radius:9px;padding:10px 13px;font:inherit;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}input[type=range]{flex:1;min-width:150px;accent-color:var(--accent)}
+.status{font-size:.92rem;color:var(--muted);line-height:1.6;min-height:1.6em}
+small,.note{color:var(--muted);line-height:1.6}video{display:none}.settings{display:flex;gap:18px;flex-wrap:wrap}.settings label{display:flex;align-items:center;gap:8px}
+a{color:#b8c8ff}
+</style>
+</head>
+<body>
+<main>
+<h1>棒人間モーション変換</h1>
+<p class="sub">動画を選ぶと、人物の骨格を推定して黒背景の棒人間として表示します。動画の解析はブラウザ内で行います（初回は姿勢推定モデルの読み込みにインターネット接続が必要です）。</p>
+<section class="panel">
+<label class="upload" for="file">📁 動画を選択</label>
+<input id="file" type="file" accept="video/*">
+<div class="status" id="status" role="status">動画を選択してください。</div>
+</section>
+<section class="panel">
+<div class="stage">
+<div id="placeholder">ここに棒人間アニメーションが表示されます<br><small>人物の全身が映り、明るく見やすい動画がおすすめです</small></div>
+<canvas id="canvas" width="640" height="360" hidden></canvas>
+</div>
+<video id="video" playsinline></video>
+<div class="controls">
+<button id="play" disabled>▶ 再生</button>
+<button id="reset" disabled>↺ 最初から</button>
+<span id="time">00:00 / 00:00</span>
+<input id="seek" type="range" min="0" max="1000" value="0" disabled aria-label="再生位置">
+</div>
+<div class="controls settings">
+<label><input id="mirror" type="checkbox"> 左右反転</label>
+<label>線の太さ <input id="thickness" type="range" min="2" max="10" value="5"></label>
+</div>
+<div class="controls">
+<button id="png" disabled>現在のコマをPNG保存</button>
+<button id="record" disabled>棒人間動画を保存</button>
+</div>
+<p class="note">※姿勢推定は推測なので、速い動き・遮蔽・画面外の手足では関節がずれることがあります。まずは1人が全身映っている動画で試してください。</p>
+</section>
+</main>
+<script type="module">
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const fileInput=document.querySelector("#file"), video=document.querySelector("#video"), canvas=document.querySelector("#canvas"), ctx=canvas.getContext("2d");
+const statusEl=document.querySelector("#status"), placeholder=document.querySelector("#placeholder"), playBtn=document.querySelector("#play"), resetBtn=document.querySelector("#reset"), seek=document.querySelector("#seek"), timeEl=document.querySelector("#time"), pngBtn=document.querySelector("#png"), recordBtn=document.querySelector("#record");
+const mirror=document.querySelector("#mirror"), thickness=document.querySelector("#thickness");
+let landmarker=null, ready=false, busy=false, lastVideoTime=-1, raf=0, recording=false, recorder=null, chunks=[], objectUrl=null;
+const edges=[
+[0,1],[1,2],[2,3],[3,7],[0,4],[4,5],[5,6],[6,8],
+[9,10],[11,12],[11,13],[13,15],[15,17],[15,19],[15,21],[17,19],
+[12,14],[14,16],[16,18],[16,20],[16,22],[18,20],
+[11,23],[12,24],[23,24],[23,25],[25,27],[27,29],[29,31],[27,31],
+[24,26],[26,28],[28,30],[30,32],[28,32]
+];
+function fmt(t){if(!Number.isFinite(t))return "00:00";let m=Math.floor(t/60),s=Math.floor(t%60);return String(m).padStart(2,"0")+":"+String(s).padStart(2,"0")}
+function setStatus(s){statusEl.textContent=s}
+async function init(){
+ if(landmarker)return;
+ setStatus("姿勢推定モデルを読み込み中…初回は少し時間がかかります。");
+ const vision=await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+ landmarker=await PoseLandmarker.createFromOptions(vision,{baseOptions:{modelAssetPath:"https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",delegate:"GPU"},runningMode:"VIDEO",numPoses:1});
+ ready=true;setStatus("準備完了。動画を解析しています。");
+}
+function drawPose(result){
+ ctx.fillStyle="#000";ctx.fillRect(0,0,canvas.width,canvas.height);
+ const pose=result?.landmarks?.[0];if(!pose){return false}
+ const pts=pose.map(p=>({x:(mirror.checked?1-p.x:p.x)*canvas.width,y:p.y*canvas.height,v:p.visibility??1}));
+ ctx.lineCap="round";ctx.lineJoin="round";ctx.lineWidth=Number(thickness.value);ctx.strokeStyle="#e9f0ff";
+ for(const [a,b] of edges){if(!pts[a]||!pts[b]||pts[a].v<.25||pts[b].v<.25)continue;ctx.beginPath();ctx.moveTo(pts[a].x,pts[a].y);ctx.lineTo(pts[b].x,pts[b].y);ctx.stroke()}
+ ctx.fillStyle="#7fa4ff";
+ for(let i=0;i<pts.length;i++){const p=pts[i];if(p.v<.25)continue;ctx.beginPath();ctx.arc(p.x,p.y,i<=10?3:4,0,Math.PI*2);ctx.fill()}
+ return true;
+}
+function render(){
+ if(!ready||video.readyState<2){raf=requestAnimationFrame(render);return}
+ if(video.currentTime!==lastVideoTime&&!busy){
+  busy=true;lastVideoTime=video.currentTime;
+  try{const result=landmarker.detectForVideo(video,performance.now());drawPose(result)}catch(e){console.error(e)}
+  busy=false;
+ }
+ updateTime();raf=requestAnimationFrame(render);
+}
+function updateTime(){if(!Number.isFinite(video.duration))return;timeEl.textContent=fmt(video.currentTime)+" / "+fmt(video.duration);if(!seek.matches(":active"))seek.value=String(Math.round((video.currentTime/video.duration)*1000)||0)}
+fileInput.addEventListener("change",async()=>{
+ const f=fileInput.files?.[0];if(!f)return;
+ if(objectUrl)URL.revokeObjectURL(objectUrl);objectUrl=URL.createObjectURL(f);video.src=objectUrl;video.load();
+ placeholder.hidden=true;canvas.hidden=false;playBtn.disabled=resetBtn.disabled=seek.disabled=pngBtn.disabled=recordBtn.disabled=true;
+ setStatus("動画を読み込んでいます…");
+ try{await init();await new Promise((resolve,reject)=>{if(video.readyState>=2)return resolve();video.onloadedmetadata=resolve;video.onerror=()=>reject(new Error("動画を読み込めませんでした"))});
+ canvas.width=video.videoWidth||640;canvas.height=video.videoHeight||360;lastVideoTime=-1;video.currentTime=0;
+ playBtn.disabled=resetBtn.disabled=seek.disabled=pngBtn.disabled=recordBtn.disabled=false;
+ drawPose(null);cancelAnimationFrame(raf);render();setStatus("解析準備完了。再生すると棒人間が動きます。");
+ }catch(e){console.error(e);setStatus("読み込みに失敗しました。インターネット接続と動画形式を確認し、ページを再読み込みしてください。")}
+});
+playBtn.addEventListener("click",async()=>{if(video.paused){try{await video.play();playBtn.textContent="⏸ 一時停止"}catch(e){setStatus("動画を再生できませんでした。")}}else{video.pause();playBtn.textContent="▶ 再生"}});
+video.addEventListener("pause",()=>{playBtn.textContent="▶ 再生"});
+video.addEventListener("play",()=>{playBtn.textContent="⏸ 一時停止"});
+resetBtn.addEventListener("click",()=>{video.pause();video.currentTime=0;lastVideoTime=-1;playBtn.textContent="▶ 再生"});
+seek.addEventListener("input",()=>{if(Number.isFinite(video.duration)){video.currentTime=Number(seek.value)/1000*video.duration;lastVideoTime=-1}});
+mirror.addEventListener("change",()=>{lastVideoTime=-1});
+thickness.addEventListener("input",()=>{lastVideoTime=-1});
+pngBtn.addEventListener("click",()=>{canvas.toBlob(blob=>{if(!blob)return;const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download="stick-figure.png";a.click();URL.revokeObjectURL(a.href)},"image/png")});
+recordBtn.addEventListener("click",async()=>{
+ if(recording){recorder?.stop();return}
+ if(!canvas.captureStream||!window.MediaRecorder){setStatus("このブラウザは動画保存に対応していません。PNG保存を利用してください。");return}
+ try{
+  chunks=[];const stream=canvas.captureStream(30);recorder=new MediaRecorder(stream,{mimeType:MediaRecorder.isTypeSupported("video/webm;codecs=vp9")?"video/webm;codecs=vp9":"video/webm"});
+  recorder.ondataavailable=e=>{if(e.data.size)chunks.push(e.data)};
+  recorder.onstop=()=>{const blob=new Blob(chunks,{type:"video/webm"});const u=URL.createObjectURL(blob);const a=document.createElement("a");a.href=u;a.download="stick-figure.webm";a.click();setTimeout(()=>URL.revokeObjectURL(u),1000);recording=false;recordBtn.textContent="棒人間動画を保存";setStatus("棒人間動画を保存しました。")};
+  recorder.start();recording=true;recordBtn.textContent="■ 保存を終了";video.currentTime=0;lastVideoTime=-1;await video.play();playBtn.textContent="⏸ 一時停止";
+  setStatus("棒人間動画を録画中です。動画の最後まで再生するか、保存終了ボタンを押してください。");
+  video.onended=()=>{if(recording)recorder.stop();playBtn.textContent="▶ 再生"};
+ }catch(e){console.error(e);setStatus("動画保存を開始できませんでした。")}
+});
+video.addEventListener("ended",()=>{playBtn.textContent="▶ 再生";if(recording&&recorder?.state!=="inactive")recorder.stop()});
+window.addEventListener("beforeunload",()=>{cancelAnimationFrame(raf);if(objectUrl)URL.revokeObjectURL(objectUrl)});
+</script>
+</body>
+</html>
